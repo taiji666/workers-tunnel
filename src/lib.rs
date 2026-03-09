@@ -33,6 +33,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let request_path = req.path().to_string();
     let uuid_str = env.var("USER_ID")?.to_string();
     let host_str = req.url()?.host_str().unwrap().to_string();
+    let request_method = req.method().to_string();
 
     if should_fallback && show_uri && request_path.contains(uuid_str.as_str()) {
         let vless_uri = format!(
@@ -51,6 +52,16 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
+    let early_data_len = early_data.as_ref().map(|data| data.len()).unwrap_or(0);
+
+    console_log!(
+        "websocket request accepted: method={}, path={}, host={}, early_data_len={}, proxy_ip_count={}",
+        request_method,
+        request_path,
+        host_str,
+        early_data_len,
+        proxy_ip.len()
+    );
 
     // Accept / handle a websocket connection
     let WebSocketPair { client, server } = WebSocketPair::new()?;
@@ -174,17 +185,46 @@ mod proxy {
             }
         };
 
+        console_log!(
+            "tunnel request parsed: network_type={}, remote_addr={}, remote_port={}, fallback_targets={}",
+            network_type,
+            remote_addr,
+            remote_port,
+            if proxy_ip.is_empty() {
+                "<none>".to_string()
+            } else {
+                proxy_ip.join(",")
+            }
+        );
+
         // process outbound
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
                 // try to connect to remote
                 for target in [vec![remote_addr], proxy_ip].concat() {
+                    console_log!(
+                        "tcp outbound attempt: target={}, port={}",
+                        target,
+                        remote_port
+                    );
                     match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
                         Ok(_) => {
+                            console_log!(
+                                "tcp outbound connected: target={}, port={}",
+                                target,
+                                remote_port
+                            );
                             // normal closed
                             return Ok(());
                         }
                         Err(e) => {
+                            console_error!(
+                                "tcp outbound failed: target={}, port={}, kind={:?}, error={}",
+                                target,
+                                remote_port,
+                                e.kind(),
+                                e
+                            );
                             // connection reset
                             if e.kind() != ErrorKind::ConnectionReset {
                                 return Err(e);
@@ -196,9 +236,18 @@ mod proxy {
                     }
                 }
 
+                console_error!(
+                    "tcp outbound exhausted all targets: remote_port={}",
+                    remote_port
+                );
                 Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
             }
             protocol::NETWORK_TYPE_UDP => {
+                console_log!(
+                    "udp outbound request: remote_addr={}, remote_port={}",
+                    remote_addr,
+                    remote_port
+                );
                 process_udp_outbound(&mut client_socket, &remote_addr, remote_port).await
             }
             unknown => Err(Error::new(
