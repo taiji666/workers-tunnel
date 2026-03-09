@@ -65,7 +65,7 @@ Replace the domain `your.domain.workers.dev` in the following configuration with
           "headers": {
             "Host": "your.domain.workers.dev"
           },
-          "path": "ws?ed=512"
+          "path": "/ws?ed=2048"
         },
         "security": "tls"
       }

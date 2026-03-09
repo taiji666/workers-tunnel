@@ -37,7 +37,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
     if !is_websocket_upgrade && show_uri && request_path.contains(uuid_str.as_str()) {
         let vless_uri = format!(
-            "vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=ws#workers-tunnel",
+            "vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=%2Fws%3Fed%3D2048#workers-tunnel",
             uuid = uuid_str,
             host = host_str
         );
