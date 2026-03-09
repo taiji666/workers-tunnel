@@ -95,7 +95,7 @@ mod proxy {
     use crate::ext::StreamExt;
     use crate::protocol;
     use crate::websocket::WebSocketStream;
-    use base64::{decode_config, URL_SAFE_NO_PAD};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
     use worker::*;
 
@@ -103,7 +103,7 @@ mod proxy {
         if let Some(data) = data {
             if !data.is_empty() {
                 let s = data.replace('+', "-").replace('/', "_").replace("=", "");
-                match decode_config(s, URL_SAFE_NO_PAD) {
+                match URL_SAFE_NO_PAD.decode(s) {
                     Ok(early_data) => return Ok(Some(early_data)),
                     Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
                 }
