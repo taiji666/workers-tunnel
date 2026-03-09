@@ -1,6 +1,7 @@
 name = "workers-tunnel"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-09-02"
+account_id = "54211bf1c63ae3a5729dabd4bf94aa2b"
 
 [build]
 command = "cargo install -q worker-build && worker-build --release"
