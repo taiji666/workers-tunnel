@@ -22,11 +22,11 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .var("FALLBACK_SITE")
         .unwrap_or(JsValue::from_str("").into())
         .to_string();
-    let should_fallback = req
+    let is_websocket_upgrade = req
         .headers()
         .get("Upgrade")?
-        .map(|up| up != *"websocket")
-        .unwrap_or(true);
+        .map(|up| up.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
 
     // show uri
     let show_uri = env.var("SHOW_URI")?.to_string().parse().unwrap_or(false);
@@ -35,7 +35,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let host_str = req.url()?.host_str().unwrap().to_string();
     let request_method = req.method().to_string();
 
-    if should_fallback && show_uri && request_path.contains(uuid_str.as_str()) {
+    if !is_websocket_upgrade && show_uri && request_path.contains(uuid_str.as_str()) {
         let vless_uri = format!(
             "vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=ws#workers-tunnel",
             uuid = uuid_str,
@@ -44,9 +44,19 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         return Response::ok(vless_uri);
     }
 
-    if should_fallback && !fallback_site.is_empty() {
+    if !is_websocket_upgrade && !fallback_site.is_empty() {
         let req = Fetch::Url(Url::parse(&fallback_site)?);
         return req.send().await;
+    }
+
+    if !is_websocket_upgrade {
+        console_log!(
+            "non-websocket request rejected: method={}, path={}, host={}",
+            request_method,
+            request_path,
+            host_str
+        );
+        return Response::error("websocket upgrade required", 426);
     }
 
     // ready early data
