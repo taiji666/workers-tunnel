@@ -12,7 +12,7 @@ Use the following rules to split traffic by file and route Cloudflare IP directl
 
 <https://github.com/Loyalsoldier/v2ray-rules-dat>
 
-Due to the limitations of Cloudflare Workers, this project supports TCP proxying and a limited UDP mode for DNS over HTTPS on port `53` only. It does not support general UDP relay or VLESS Mux, and it is not possible to use the proxy to connect to Cloudflare's IP addresses. It is recommended to use the following routing configuration to establish a direct connection to Cloudflare's IP addresses.
+Due to the limitations of Cloudflare Workers, this project supports TCP proxying, VLESS Mux for TCP substreams, and a limited UDP mode for DNS over HTTPS on port `53` only. It does not support general UDP relay or muxed UDP/XUDP, and it is not possible to use the proxy to connect to Cloudflare's IP addresses. It is recommended to use the following routing configuration to establish a direct connection to Cloudflare's IP addresses.
 
 Replace the domain `your.domain.workers.dev` in the following configuration with your Cloudflare Workers domain.
 

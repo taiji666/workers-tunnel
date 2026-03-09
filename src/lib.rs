@@ -111,6 +111,7 @@ mod protocol {
 }
 
 mod proxy {
+    use std::collections::HashMap;
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -118,7 +119,12 @@ mod proxy {
     use crate::protocol;
     use crate::websocket::WebSocketStream;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
+    use futures_channel::mpsc;
+    use futures_util::StreamExt as FuturesStreamExt;
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf,
+        copy_bidirectional, split,
+    };
     use uuid::Uuid;
     use worker::*;
 
@@ -150,8 +156,69 @@ mod proxy {
     #[derive(Debug, Eq, PartialEq)]
     struct VlessRequest {
         command: Command,
+        target: Option<TargetAddress>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TargetAddress {
         remote_port: u16,
         remote_addr: String,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MuxSessionStatus {
+        New = 0x01,
+        Keep = 0x02,
+        End = 0x03,
+        KeepAlive = 0x04,
+    }
+
+    impl TryFrom<u8> for MuxSessionStatus {
+        type Error = Error;
+
+        fn try_from(value: u8) -> Result<Self> {
+            match value {
+                0x01 => Ok(Self::New),
+                0x02 => Ok(Self::Keep),
+                0x03 => Ok(Self::End),
+                0x04 => Ok(Self::KeepAlive),
+                _ => Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid mux session status: {}", value),
+                )),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MuxNetwork {
+        Tcp = 0x01,
+        Udp = 0x02,
+    }
+
+    impl TryFrom<u8> for MuxNetwork {
+        type Error = Error;
+
+        fn try_from(value: u8) -> Result<Self> {
+            match value {
+                0x01 => Ok(Self::Tcp),
+                0x02 => Ok(Self::Udp),
+                _ => Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid mux network: {}", value),
+                )),
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct MuxFrame {
+        session_id: u16,
+        status: MuxSessionStatus,
+        has_data: bool,
+        has_error: bool,
+        target: Option<(MuxNetwork, TargetAddress)>,
+        data: Vec<u8>,
     }
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
@@ -192,14 +259,15 @@ mod proxy {
         _ = reader.read_bytes(addons_length as usize).await?;
 
         let command = Command::try_from(reader.read_u8().await?)?;
-        let remote_port = reader.read_u16().await?;
-        let remote_addr = read_remote_address(reader).await?;
+        let target = match command {
+            Command::Tcp | Command::Udp => Some(TargetAddress {
+                remote_port: reader.read_u16().await?,
+                remote_addr: read_remote_address(reader).await?,
+            }),
+            Command::Mux => None,
+        };
 
-        Ok(VlessRequest {
-            command,
-            remote_port,
-            remote_addr,
-        })
+        Ok(VlessRequest { command, target })
     }
 
     async fn read_remote_address<R>(reader: &mut R) -> Result<String>
@@ -240,6 +308,187 @@ mod proxy {
         })
     }
 
+    async fn read_mux_frame<R>(reader: &mut R) -> Result<MuxFrame>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let metadata_len = reader.read_u16().await?;
+        if !(4..=512).contains(&metadata_len) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid mux metadata length: {}", metadata_len),
+            ));
+        }
+
+        let metadata = reader.read_bytes(metadata_len as usize).await?;
+        let session_id = u16::from_be_bytes([metadata[0], metadata[1]]);
+        let status = MuxSessionStatus::try_from(metadata[2])?;
+        let options = metadata[3];
+        let has_data = options & 0x01 != 0;
+        let has_error = options & 0x02 != 0;
+
+        let target = if status == MuxSessionStatus::New {
+            let mut metadata_reader = &metadata[4..];
+            let network = MuxNetwork::try_from(metadata_reader.read_u8().await?)?;
+            let remote_port = metadata_reader.read_u16().await?;
+            let remote_addr = read_remote_address(&mut metadata_reader).await?;
+            Some((
+                network,
+                TargetAddress {
+                    remote_port,
+                    remote_addr,
+                },
+            ))
+        } else {
+            None
+        };
+
+        let data = if has_data {
+            let data_len = reader.read_u16().await?;
+            reader.read_bytes(data_len as usize).await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(MuxFrame {
+            session_id,
+            status,
+            has_data,
+            has_error,
+            target,
+            data,
+        })
+    }
+
+    fn encode_target_address(target: &TargetAddress) -> Result<Vec<u8>> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&target.remote_port.to_be_bytes());
+
+        if let Ok(addr) = target.remote_addr.parse::<Ipv4Addr>() {
+            encoded.push(protocol::ADDRESS_TYPE_IPV4);
+            encoded.extend_from_slice(&addr.octets());
+            return Ok(encoded);
+        }
+
+        if let Some(stripped) = target
+            .remote_addr
+            .strip_prefix('[')
+            .and_then(|addr| addr.strip_suffix(']'))
+        {
+            let addr = stripped.parse::<Ipv6Addr>().map_err(|err| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid ipv6 address: {}", err),
+                )
+            })?;
+            encoded.push(protocol::ADDRESS_TYPE_IPV6);
+            encoded.extend_from_slice(&addr.octets());
+            return Ok(encoded);
+        }
+
+        if target.remote_addr.is_empty() || target.remote_addr.len() > u8::MAX as usize {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "domain address must be 1..=255 bytes",
+            ));
+        }
+
+        encoded.push(protocol::ADDRESS_TYPE_DOMAIN);
+        encoded.push(target.remote_addr.len() as u8);
+        encoded.extend_from_slice(target.remote_addr.as_bytes());
+        Ok(encoded)
+    }
+
+    fn encode_mux_frame(
+        session_id: u16,
+        status: MuxSessionStatus,
+        has_error: bool,
+        target: Option<(MuxNetwork, &TargetAddress)>,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(&session_id.to_be_bytes());
+        metadata.push(status as u8);
+        let mut options = 0u8;
+        if !data.is_empty() {
+            options |= 0x01;
+        }
+        if has_error {
+            options |= 0x02;
+        }
+        metadata.push(options);
+
+        if status == MuxSessionStatus::New {
+            let (network, target) = target.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "mux new frame requires target metadata",
+                )
+            })?;
+            metadata.push(network as u8);
+            metadata.extend_from_slice(&encode_target_address(target)?);
+        }
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(metadata.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&metadata);
+        if !data.is_empty() {
+            if data.len() > u16::MAX as usize {
+                return Err(Error::new(ErrorKind::InvalidInput, "mux payload too large"));
+            }
+            frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            frame.extend_from_slice(data);
+        }
+        Ok(frame)
+    }
+
+    fn send_mux_frame(
+        tx: &mpsc::UnboundedSender<Vec<u8>>,
+        session_id: u16,
+        status: MuxSessionStatus,
+        has_error: bool,
+        target: Option<(MuxNetwork, &TargetAddress)>,
+        data: &[u8],
+    ) -> Result<()> {
+        tx.unbounded_send(encode_mux_frame(
+            session_id, status, has_error, target, data,
+        )?)
+        .map_err(|_| Error::new(ErrorKind::BrokenPipe, "mux writer channel closed"))
+    }
+
+    async fn connect_tcp_socket(target: &str, port: u16) -> Result<Socket> {
+        let remote_socket = Socket::builder().connect(target, port).map_err(|e| {
+            Error::new(
+                ErrorKind::ConnectionAborted,
+                format!("connect to remote failed: {}", e),
+            )
+        })?;
+
+        remote_socket.opened().await.map_err(|e| {
+            Error::new(
+                ErrorKind::ConnectionReset,
+                format!("remote socket not opened: {}", e),
+            )
+        })?;
+
+        Ok(remote_socket)
+    }
+
+    async fn connect_tcp_socket_with_fallback(
+        target: &TargetAddress,
+        proxy_ip: &[String],
+    ) -> Result<(Socket, String)> {
+        for candidate in [vec![target.remote_addr.clone()], proxy_ip.to_vec()].concat() {
+            match connect_tcp_socket(&candidate, target.remote_port).await {
+                Ok(socket) => return Ok((socket, candidate)),
+                Err(err) if err.kind() == ErrorKind::ConnectionReset => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
+    }
+
     pub async fn run_tunnel(
         mut client_socket: WebSocketStream<'_>,
         user_id: UserId,
@@ -248,10 +497,9 @@ mod proxy {
         let request = read_vless_request(&mut client_socket, &user_id).await?;
 
         console_log!(
-            "tunnel request parsed: command={:?}, remote_addr={}, remote_port={}, fallback_targets={}",
+            "tunnel request parsed: command={:?}, target={:?}, fallback_targets={}",
             request.command,
-            request.remote_addr,
-            request.remote_port,
+            request.target,
             if proxy_ip.is_empty() {
                 "<none>".to_string()
             } else {
@@ -262,21 +510,28 @@ mod proxy {
         // process outbound
         match request.command {
             Command::Tcp => {
+                let target = request.target.ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidData, "tcp request missing target")
+                })?;
                 // try to connect to remote
-                for target in [vec![request.remote_addr.clone()], proxy_ip].concat() {
+                for outbound_target in [vec![target.remote_addr.clone()], proxy_ip].concat() {
                     console_log!(
                         "tcp outbound attempt: target={}, port={}",
-                        target,
-                        request.remote_port
+                        outbound_target,
+                        target.remote_port
                     );
-                    match process_tcp_outbound(&mut client_socket, &target, request.remote_port)
-                        .await
+                    match process_tcp_outbound(
+                        &mut client_socket,
+                        &outbound_target,
+                        target.remote_port,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             console_log!(
                                 "tcp outbound connected: target={}, port={}",
-                                target,
-                                request.remote_port
+                                outbound_target,
+                                target.remote_port
                             );
                             // normal closed
                             return Ok(());
@@ -284,8 +539,8 @@ mod proxy {
                         Err(e) => {
                             console_error!(
                                 "tcp outbound failed: target={}, port={}, kind={:?}, error={}",
-                                target,
-                                request.remote_port,
+                                outbound_target,
+                                target.remote_port,
                                 e.kind(),
                                 e
                             );
@@ -302,27 +557,183 @@ mod proxy {
 
                 console_error!(
                     "tcp outbound exhausted all targets: remote_port={}",
-                    request.remote_port
+                    target.remote_port
                 );
                 Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
             }
             Command::Udp => {
+                let target = request.target.ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidData, "udp request missing target")
+                })?;
                 console_log!(
                     "udp outbound request: remote_addr={}, remote_port={}",
-                    request.remote_addr,
-                    request.remote_port
+                    target.remote_addr,
+                    target.remote_port
                 );
-                process_udp_outbound(
-                    &mut client_socket,
-                    &request.remote_addr,
-                    request.remote_port,
-                )
-                .await
+                process_udp_outbound(&mut client_socket, &target.remote_addr, target.remote_port)
+                    .await
             }
-            Command::Mux => Err(Error::new(
-                ErrorKind::InvalidData,
-                "vless mux is not supported on Cloudflare Workers",
-            )),
+            Command::Mux => process_mux_outbound(client_socket, proxy_ip).await,
+        }
+    }
+
+    async fn process_mux_outbound(
+        mut client_socket: WebSocketStream<'_>,
+        proxy_ip: Vec<String>,
+    ) -> Result<()> {
+        let ws = client_socket.websocket();
+        let (tx, mut rx) = mpsc::unbounded::<Vec<u8>>();
+        let writer_ws = ws.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(frame) = FuturesStreamExt::next(&mut rx).await {
+                if let Err(err) = writer_ws.send_with_bytes(frame) {
+                    console_error!("mux writer send failed: {}", err);
+                    break;
+                }
+            }
+        });
+
+        write_response_header(&mut client_socket).await?;
+
+        let mut sessions: HashMap<u16, WriteHalf<Socket>> = HashMap::new();
+        loop {
+            let frame = match read_mux_frame(&mut client_socket).await {
+                Ok(frame) => frame,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            };
+
+            match frame.status {
+                MuxSessionStatus::KeepAlive => {}
+                MuxSessionStatus::End => {
+                    sessions.remove(&frame.session_id);
+                }
+                MuxSessionStatus::New => {
+                    let (network, target) = frame.target.ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "mux new frame missing target")
+                    })?;
+                    if network != MuxNetwork::Tcp {
+                        send_mux_frame(
+                            &tx,
+                            frame.session_id,
+                            MuxSessionStatus::End,
+                            true,
+                            None,
+                            &[],
+                        )?;
+                        continue;
+                    }
+
+                    let (socket, connected_target) = match connect_tcp_socket_with_fallback(
+                        &target, &proxy_ip,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            console_error!(
+                                "mux tcp outbound failed: session_id={}, target={}, port={}, error={}",
+                                frame.session_id,
+                                target.remote_addr,
+                                target.remote_port,
+                                err
+                            );
+                            send_mux_frame(
+                                &tx,
+                                frame.session_id,
+                                MuxSessionStatus::End,
+                                true,
+                                None,
+                                &[],
+                            )?;
+                            continue;
+                        }
+                    };
+
+                    console_log!(
+                        "mux tcp outbound connected: session_id={}, target={}, port={}",
+                        frame.session_id,
+                        connected_target,
+                        target.remote_port
+                    );
+
+                    let (mut read_half, mut write_half) = split(socket);
+                    if !frame.data.is_empty() {
+                        write_half.write_all(&frame.data).await?;
+                    }
+                    sessions.insert(frame.session_id, write_half);
+
+                    let session_id = frame.session_id;
+                    let tx_clone = tx.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(err) =
+                            pump_mux_downlink(session_id, &mut read_half, tx_clone).await
+                        {
+                            console_error!(
+                                "mux downlink failed for session {}: {}",
+                                session_id,
+                                err
+                            );
+                        }
+                    });
+                }
+                MuxSessionStatus::Keep => {
+                    let Some(writer) = sessions.get_mut(&frame.session_id) else {
+                        send_mux_frame(
+                            &tx,
+                            frame.session_id,
+                            MuxSessionStatus::End,
+                            true,
+                            None,
+                            &[],
+                        )?;
+                        continue;
+                    };
+
+                    if !frame.data.is_empty() {
+                        if let Err(err) = writer.write_all(&frame.data).await {
+                            console_error!(
+                                "mux uplink write failed: session_id={}, error={}",
+                                frame.session_id,
+                                err
+                            );
+                            sessions.remove(&frame.session_id);
+                            send_mux_frame(
+                                &tx,
+                                frame.session_id,
+                                MuxSessionStatus::End,
+                                true,
+                                None,
+                                &[],
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn pump_mux_downlink(
+        session_id: u16,
+        read_half: &mut ReadHalf<Socket>,
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<()> {
+        let mut buffer = vec![0u8; 8192];
+        loop {
+            let read = read_half.read(&mut buffer).await?;
+            if read == 0 {
+                send_mux_frame(&tx, session_id, MuxSessionStatus::End, false, None, &[])?;
+                return Ok(());
+            }
+
+            send_mux_frame(
+                &tx,
+                session_id,
+                MuxSessionStatus::Keep,
+                false,
+                None,
+                &buffer[..read],
+            )?;
         }
     }
 
@@ -430,7 +841,10 @@ mod proxy {
 
     #[cfg(test)]
     mod tests {
-        use super::{Command, VlessRequest, parse_early_data, parse_user_id, read_vless_request};
+        use super::{
+            Command, MuxNetwork, MuxSessionStatus, TargetAddress, VlessRequest, parse_early_data,
+            parse_user_id, read_mux_frame, read_vless_request,
+        };
         use crate::protocol;
         use tokio_test::{block_on, io::Builder};
 
@@ -484,8 +898,33 @@ mod proxy {
                 request,
                 VlessRequest {
                     command: Command::Tcp,
-                    remote_port: 443,
-                    remote_addr: "example.com".to_string(),
+                    target: Some(TargetAddress {
+                        remote_port: 443,
+                        remote_addr: "example.com".to_string(),
+                    }),
+                }
+            );
+        }
+
+        #[test]
+        fn parse_vless_request_for_mux_stops_after_command() {
+            let user_id = parse_user_id(sample_uuid()).expect("uuid should parse");
+            let frame = [
+                vec![protocol::VERSION],
+                user_id.to_vec(),
+                vec![0, protocol::COMMAND_MUX],
+            ]
+            .concat();
+            let mut reader = Builder::new().read(&frame).build();
+
+            let request =
+                block_on(read_vless_request(&mut reader, &user_id)).expect("request should parse");
+
+            assert_eq!(
+                request,
+                VlessRequest {
+                    command: Command::Mux,
+                    target: None,
                 }
             );
         }
@@ -522,6 +961,46 @@ mod proxy {
             let err = block_on(read_vless_request(&mut reader, &user_id))
                 .expect_err("empty domain must fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        #[test]
+        fn parse_mux_frame_for_tcp_session() {
+            let frame = [
+                vec![0x00, 0x14],
+                vec![
+                    0x00,
+                    0x01,
+                    MuxSessionStatus::New as u8,
+                    0x01,
+                    MuxNetwork::Tcp as u8,
+                    0x01,
+                    0xbb,
+                    protocol::ADDRESS_TYPE_DOMAIN,
+                    11,
+                ],
+                b"example.com".to_vec(),
+                vec![0x00, 0x05],
+                b"hello".to_vec(),
+            ]
+            .concat();
+            let mut reader = Builder::new().read(&frame).build();
+
+            let parsed = block_on(read_mux_frame(&mut reader)).expect("mux frame should parse");
+
+            assert_eq!(parsed.session_id, 1);
+            assert_eq!(parsed.status, MuxSessionStatus::New);
+            assert!(parsed.has_data);
+            assert_eq!(parsed.data, b"hello");
+            assert_eq!(
+                parsed.target,
+                Some((
+                    MuxNetwork::Tcp,
+                    TargetAddress {
+                        remote_port: 443,
+                        remote_addr: "example.com".to_string(),
+                    },
+                ))
+            );
         }
     }
 }
@@ -589,6 +1068,10 @@ mod websocket {
             }
 
             Self { ws, stream, buffer }
+        }
+
+        pub fn websocket(&self) -> WebSocket {
+            self.ws.clone()
         }
     }
 
