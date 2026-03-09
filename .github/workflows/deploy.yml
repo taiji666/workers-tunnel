@@ -41,6 +41,8 @@ jobs:
                   toolchain: stable
                   target: wasm32-unknown-unknown
             - run: cargo install cargo-generate
+            - name: Run tests
+              run: cargo test
             - name: Build worker
               run: npx wrangler deploy --dry-run
     deploy:
