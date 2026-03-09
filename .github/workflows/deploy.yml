@@ -1,20 +1,62 @@
 name: Deploy
 
 on:
+    push:
+        branches:
+            - main
+        paths:
+            - "src/**"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "package.json"
+            - "package-lock.json"
+            - "wrangler.toml"
+            - ".github/workflows/deploy.yml"
+    pull_request:
+        paths:
+            - "src/**"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "package.json"
+            - "package-lock.json"
+            - "wrangler.toml"
+            - ".github/workflows/deploy.yml"
     workflow_dispatch:
 
 jobs:
-    deploy:
+    build:
         runs-on: ubuntu-latest
-        name: Deploy
+        name: Build
         steps:
             - uses: actions/checkout@v4
             - name: Setup Node.js
               uses: actions/setup-node@v3
               with:
                   node-version: "22"
+                  cache: "npm"
             - name: Install modules
-              run: npm install
+              run: npm ci
+            - uses: actions-rust-lang/setup-rust-toolchain@v1
+              with:
+                  toolchain: stable
+                  target: wasm32-unknown-unknown
+            - run: cargo install cargo-generate
+            - name: Build worker
+              run: npx wrangler deploy --dry-run
+    deploy:
+        runs-on: ubuntu-latest
+        name: Deploy
+        needs: build
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+        steps:
+            - uses: actions/checkout@v4
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: "22"
+                  cache: "npm"
+            - name: Install modules
+              run: npm ci
             - uses: actions-rust-lang/setup-rust-toolchain@v1
               with:
                   toolchain: stable
